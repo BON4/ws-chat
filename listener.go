@@ -17,12 +17,6 @@ const (
 
 //var wsListeners = make(map[string]net.Listener)
 
-var payloadPool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, 400)
-	},
-}
-
 type WsPayload []byte
 
 func (wsp WsPayload) Bytes() []byte {return wsp}
@@ -93,9 +87,15 @@ func closeWs(conn net.Conn) error {
 	return ws.WriteHeader(conn, header)
 }
 
+var payloadPool = sync.Pool{
+	New: func() interface{} {
+		return make(WsPayload, 400)
+	},
+}
+
+
 type WsConnection struct {
 	closeChan chan struct{}
-	closeCond *sync.Cond
 	conn net.Conn
 
 	in chan WsPayload
@@ -104,7 +104,6 @@ type WsConnection struct {
 func NewWsConnection(conn net.Conn) WsConnection {
 	return WsConnection{
 		closeChan: make(chan struct{}),
-		closeCond: sync.NewCond(&sync.Mutex{}),
 		conn:      conn,
 		in: make(chan WsPayload),
 	}
@@ -113,11 +112,14 @@ func NewWsConnection(conn net.Conn) WsConnection {
 func (wc *WsConnection) read() {
 	defer func() {
 		log.Println("Reader closed")
+
+		//Send signal that client close the connection
 		wc.closeChan <- struct{}{}
 	}()
 
-	var payload WsPayload = payloadPool.Get().([]byte)
-	defer payloadPool.Put(payload)
+	//var payload WsPayload = payloadPool.Get().(WsPayload)
+	//defer payloadPool.Put(payload)
+	var payload WsPayload
 	for {
 		n, err := payload.ReadFrom(wc.conn)
 		if err != nil {
@@ -126,19 +128,30 @@ func (wc *WsConnection) read() {
 			}
 			return
 		}
-		wc.in <- payload[:n]
+		if n > 0 {
+			wc.in <- payload[:n]
+		}
 	}
 }
 
 func (wc *WsConnection) write() {
-	var payload WsPayload = payloadPool.Get().([]byte)
+	var payload = payloadPool.Get().(WsPayload)
 	defer payloadPool.Put(payload)
 
 	for {
 		select {
 		case <-wc.closeChan:
 			log.Println("Writer closed")
-			wc.closeCond.Broadcast()
+
+			//Closing websocket connection
+			if err := closeWs(wc.conn); err != nil {
+				log.Printf("Error while closeing the connection: %s\n", err.Error())
+			}
+
+			if err := wc.conn.Close(); err != nil {
+				log.Printf("Error while closeing the connection internal: %s\n", err.Error())
+			}
+
 			return
 		case b := <- wc.in:
 			_, err := b.WriteTo(wc.conn)
@@ -152,18 +165,6 @@ func (wc *WsConnection) write() {
 	}
 }
 
-func (wc *WsConnection) close() {
-	wc.closeCond.L.Lock()
-	wc.closeCond.Wait()
-	if err := closeWs(wc.conn); err != nil {
-		log.Printf("Error while closeing the connection: %s\n", err.Error())
-	}
-
-	if err := wc.conn.Close(); err != nil {
-		log.Printf("Error while closeing the connection internal: %s\n", err.Error())
-	}
-	wc.closeCond.L.Unlock()
-}
 
 func ListenWS(srv io.ReadWriteCloser, network, addr string) error {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -187,6 +188,5 @@ func ListenWS(srv io.ReadWriteCloser, network, addr string) error {
 		wsConn := NewWsConnection(conn)
 		go wsConn.read()
 		go wsConn.write()
-		go wsConn.close()
 	}
 }
