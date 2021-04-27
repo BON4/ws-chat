@@ -1,19 +1,76 @@
 package ws_chat
 
 import (
+	"errors"
 	"github.com/gobwas/ws"
 	"io"
 	"log"
 	"net"
 	"sync"
 )
+const (
+	BinaryType = iota + 1
+	StringType
 
-var wsListeners = make(map[string]net.Listener)
+	MaxPayloadSize = 10 << 24 //10 megs
+)
+
+//var wsListeners = make(map[string]net.Listener)
 
 var payloadPool = sync.Pool{
 	New: func() interface{} {
 		return make([]byte, 400)
 	},
+}
+
+type WsPayload []byte
+
+func (wsp WsPayload) Bytes() []byte {return wsp}
+func (wsp WsPayload) String() string {return string(wsp)}
+
+func (wsp *WsPayload) ReadFrom(conn io.Reader) (int64, error) {
+	frame, err := ws.ReadFrame(conn)
+	if err != nil {
+		log.Printf("Got error while reading header: %s\n", err.Error())
+		return 0, err
+	}
+
+	if frame.Header.OpCode.IsControl() {
+		//log.Printf("Client close the connection with: %d\n", frame.Header.OpCode)
+		return 0, io.EOF
+	}
+
+	if frame.Header.Length > MaxPayloadSize {
+		return 0, errors.New("maximum payload size exceeded")
+	}
+
+	*wsp = frame.Payload
+
+	if frame.Header.Masked {
+		ws.Cipher(*wsp, frame.Header.Mask, 0)
+	}
+
+	return int64(len(*wsp)), nil
+}
+
+func (wsp WsPayload) WriteTo(conn io.Writer) (int64, error) {
+	//if err := ws.WriteHeader(conn, ws.Header{
+	//	Fin:    true,
+	//	Rsv:    0,
+	//	OpCode: ws.OpText,
+	//	Masked: false,
+	//	Mask:   [4]byte{},
+	//	Length: int64(len(wsp)),
+	//}); err != nil {
+	//	log.Printf("Got error while writing header: %s\n", err.Error())
+	//	return 0, err
+	//}
+	if err := ws.WriteFrame(conn, ws.NewFrame(ws.OpText, true, wsp)); err != nil {
+		log.Printf("Got error while writing the connction: %s\n", err.Error())
+		return 0, err
+	}
+
+	return int64(len(wsp)), nil
 }
 
 func closeWs(conn net.Conn) error {
@@ -25,110 +82,96 @@ func closeWs(conn net.Conn) error {
 		Mask:   [4]byte{},
 		Length: 0,
 	}
-	header.Masked = false
 
-	if err := ws.WriteFrame(conn, ws.NewCloseFrame(ws.NewCloseFrameBody(1000, "Client close the connection"))); err != nil {
+	b := ws.NewCloseFrameBody(1000, "Client close the connection")
+
+	header.Length = int64(len(b))
+	if err := ws.WriteFrame(conn, ws.NewCloseFrame(b)); err != nil {
 		return err
 	}
 
 	return ws.WriteHeader(conn, header)
 }
 
-func readWs(conn net.Conn, w io.WriteCloser, wg *sync.WaitGroup) {
-	defer wg.Done()
-	defer w.Close()
+type WsConnection struct {
+	closeChan chan struct{}
+	closeCond *sync.Cond
+	conn net.Conn
 
-	payloadForConn := payloadPool.Get().([]byte)
-	defer payloadPool.Put(payloadForConn)
+	in chan WsPayload
+}
+
+func NewWsConnection(conn net.Conn) WsConnection {
+	return WsConnection{
+		closeChan: make(chan struct{}),
+		closeCond: sync.NewCond(&sync.Mutex{}),
+		conn:      conn,
+		in: make(chan WsPayload),
+	}
+}
+
+func (wc *WsConnection) read() {
+	defer func() {
+		log.Println("Reader closed")
+		wc.closeChan <- struct{}{}
+	}()
+
+	var payload WsPayload = payloadPool.Get().([]byte)
+	defer payloadPool.Put(payload)
+	for {
+		n, err := payload.ReadFrom(wc.conn)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Error while reading from connection: %s\n", err.Error())
+			}
+			return
+		}
+		wc.in <- payload[:n]
+	}
+}
+
+func (wc *WsConnection) write() {
+	var payload WsPayload = payloadPool.Get().([]byte)
+	defer payloadPool.Put(payload)
 
 	for {
-		header, err := ws.ReadHeader(conn)
-		if err != nil {
-			log.Printf("Got error while reading header: %s\n", err.Error())
+		select {
+		case <-wc.closeChan:
+			log.Println("Writer closed")
+			wc.closeCond.Broadcast()
 			return
-		}
-
-		if header.OpCode == ws.OpClose {
-			log.Println("Client close the connection with OpClose")
-			return
-		}
-
-		payload := payloadForConn[:header.Length]
-
-		_, err = conn.Read(payload)
-		if err != nil {
-			log.Printf("Got error while reading the connction: %s\n", err.Error())
-			return
-		}
-
-		if header.OpCode == ws.OpClose {
-			return
-		}
-
-		if header.Masked {
-			ws.Cipher(payload, header.Mask, 0)
-		}
-
-		_, err = w.Write(payload)
-		if err != nil {
-			log.Printf("Got error while writeing to writer: %s\n", err.Error())
-			return
+		case b := <- wc.in:
+			_, err := b.WriteTo(wc.conn)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("Error while reading from connection: %s\n", err.Error())
+				}
+				return
+			}
 		}
 	}
 }
 
-func writeWs(conn net.Conn, r io.ReadCloser, wg *sync.WaitGroup) {
-	defer wg.Done()
-	defer r.Close()
-	payloadForConn := payloadPool.Get().([]byte)
-	defer payloadPool.Put(payloadForConn)
-
-	header := ws.Header{
-		Fin:    true,
-		Rsv:    0,
-		OpCode: ws.OpText,
-		Masked: false,
-		Mask:   [4]byte{},
-		Length: 0,
+func (wc *WsConnection) close() {
+	wc.closeCond.L.Lock()
+	wc.closeCond.Wait()
+	if err := closeWs(wc.conn); err != nil {
+		log.Printf("Error while closeing the connection: %s\n", err.Error())
 	}
-	header.Masked = false
 
-	for {
-		n, err := r.Read(payloadForConn)
-		if err != nil {
-			log.Printf("Got error while reading from server reader: %s\n", err.Error())
-			return
-		}
-
-		header.Length = int64(n)
-
-		if err := ws.WriteHeader(conn, header); err != nil {
-			log.Printf("Got error while writing header: %s\n", err.Error())
-			return
-		}
-
-		if _, err := conn.Write(payloadForConn[:n]); err != nil {
-			log.Printf("Got error while writing the connction: %s\n", err.Error())
-			return
-		}
+	if err := wc.conn.Close(); err != nil {
+		log.Printf("Error while closeing the connection internal: %s\n", err.Error())
 	}
+	wc.closeCond.L.Unlock()
 }
 
-
-func Listen(network, addr string) error {
+func ListenWS(srv io.ReadWriteCloser, network, addr string) error {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	lnKey := network + "/" + addr
-
-	//TODO: If listener already exist
-
-	//If listener does not exists
 	ln, err := net.Listen(network, addr)
 	if err != nil {
 		return err
 	}
-
-	wsListeners[lnKey] = ln
 
 	for {
 		conn, err := ln.Accept()
@@ -141,27 +184,9 @@ func Listen(network, addr string) error {
 			return err
 		}
 
-		go func() {
-			defer conn.Close()
-
-			log.Printf("connection open: %s\n", conn.RemoteAddr())
-			defer log.Printf("connection closed: %s\n", conn.RemoteAddr())
-
-			r, w := io.Pipe()
-
-			var wg sync.WaitGroup
-
-			wg.Add(1)
-			go readWs(conn, w, &wg)
-			wg.Add(1)
-			go writeWs(conn, r, &wg)
-
-
-			wg.Wait()
-			if err := closeWs(conn); err != nil {
-				log.Printf("Error while closeing the connection: %s\n", err.Error())
-			}
-			return
-		}()
+		wsConn := NewWsConnection(conn)
+		go wsConn.read()
+		go wsConn.write()
+		go wsConn.close()
 	}
 }

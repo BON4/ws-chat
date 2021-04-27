@@ -8,15 +8,6 @@
 <script>
     var socket;
 
-    function openConn() {
-        if (typeof socket === 'undefined') {
-            newConn()
-            return
-        }
-        closeConn()
-        newConn()
-    }
-
     function newConn(){
         socket = new WebSocket("ws://localhost:8080");
 
@@ -35,7 +26,7 @@
             } else {
                 // e.g. server process killed or network down
                 // event.code is usually 1006 in this case
-                console.log(`[close] Connection died, code=${event.code} reason=${event}`);
+                console.log(`[close] Connection died, code=${event.code} reason=${event.reason}`);
             }
         };
 
@@ -44,8 +35,18 @@
         };
     }
 
+    function openConn() {
+        if (typeof socket === 'undefined') {
+            newConn()
+            return
+        }
+        closeConn()
+        setTimeout(() => {}, 7000);
+        newConn()
+    }
+
     function closeConn() {
-        socket.close(1000, "Client close the connection")
+        socket.close(1000, "Client close the connection");
     }
 
     function sendMsg(){
